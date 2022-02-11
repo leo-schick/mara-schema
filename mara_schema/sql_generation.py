@@ -111,9 +111,9 @@ def data_set_sql_query(data_set: DataSet,
                         continue  # Exclude attributes from linked entities
 
                 first = add_column_definition(table_alias=table_alias, column_name=column_name,
-                                              column_alias=column_alias,
-                                              cast_to_text=attribute.type == Type.ENUM, first=first,
-                                              custom_column_expression=custom_column_expression)
+                                            column_alias=column_alias,
+                                            cast_to_text=attribute.type == Type.ENUM, first=first,
+                                            custom_column_expression=custom_column_expression)
 
         # Only add foreign key columns of linked entities
         elif star_schema_transitive_fks is False and path:
@@ -195,3 +195,166 @@ def table_alias_for_path(path: (EntityLink,)) -> str:
 def foreign_key_column_name(name) -> str:
     """Turns a table alias into a foreign key column name"""
     return f'{name}_fk'
+
+
+def aggregate_table_sql_query(data_set: DataSet,
+                              human_readable_columns=True,
+                              personal_data=True,
+                              high_cardinality_attributes=True,
+                              engine: sqlalchemy.engine.Engine = None,
+                              group_by: [] = [],
+                              date_column: str = '',
+                              by_week: bool = False,
+                              by_month: bool = False,
+                              by_year: bool = False) -> str:
+    """
+    Returns a SQL select statement that create aggregate table for a data set
+
+    Args:
+        data_set: the data set to create aggregate table for
+        human_readable_columns: Whether to use "Customer name" rather than "customer_name" as column name
+        pre_computed_metrics: Whether to pre-compute composed metrics, counts and distinct counts on row level
+        star_schema: Whether to add foreign keys to the tables of linked entities rather than including their attributes
+        personal_data: Whether to include attributes that are marked as personal data
+        high_cardinality_attributes: Whether to include attributes that are marked to have a high cardinality
+        engine: A sqlalchemy engine that is used to quote database identifiers. Defaults to a PostgreSQL engine.
+        group_by: A list by which you can do aggregation
+        by_week:
+
+    Returns:
+        A string containing the select statement
+    """
+    engine = engine or sqlalchemy.create_engine(f'postgresql+psycopg2://')
+
+    def quote(name) -> str:
+        """Quote a column or table name for the specified database engine"""
+        return engine.dialect.identifier_preparer.quote(name)
+
+    # alias for the underlying table of the entity of the data set
+    entity_table_alias = database_identifier(data_set.entity.name)
+
+    # progressively build the query
+    query = 'SELECT'
+
+    column_definitions = []
+    group_by_column = []
+    # Iterate all connected entities
+    for path, attributes in data_set.connected_attributes().items():
+        first = True  # for adding an empty line between each entity
+
+        # helper function for adding a column
+
+        def add_column_definition(table_alias: str, column_name: str, column_alias: str,
+                                  cast_to_text: bool, first: bool, custom_column_expression: str = None,
+                                  date_column:str = '', date_column_name: str = ''):
+            column_definition = '\n    ' if first else '    '
+            if column_alias.lower() in [e.lower() for e in group_by] or (group_by == [] and column_alias.lower() != date_column.lower()):
+                column_definition += custom_column_expression or f'{quote(table_alias)}.{quote(column_name)}'
+                group_by_column.append(custom_column_expression or f'{quote(table_alias)}.{quote(column_name)}')
+                if cast_to_text:
+                    column_definition += '::TEXT'
+                if column_alias != column_name:
+                    column_definition += f' AS {quote(column_alias)}'
+                column_definitions.append(column_definition)
+            elif column_alias.lower() == date_column.lower():
+                column_definition = ''
+                if by_week:
+                    column = f"to_char(to_date({date_column_name}:: TEXT, 'YYYYMMDD'), 'IYYYIW')"
+
+                    column_definition = f"\n    {column}:: INTEGER AS week_id"
+                    column_definitions.append(column_definition)
+                    group_by_column.append(column)
+                if by_month:
+                    column = f"to_char(to_date({date_column_name}:: TEXT, 'YYYYMMDD'), 'YYYYMM')"
+                    column_definition = f"\n    {column}:: INTEGER AS month_id"
+                    column_definitions.append(column_definition)
+                    group_by_column.append(column)
+
+                if by_year:
+                    column = f"extract('isoyear' from to_date({date_column_name}:: TEXT, 'YYYYMMDD'))"
+                    column_definition = f"\n    {column}:: INTEGER AS year_id"
+                    column_definitions.append(column_definition)
+                    group_by_column.append(column)
+
+            return False
+
+        # Add columns for all attributes
+        for name, attribute in attributes.items():
+            if attribute.personal_data and not personal_data:
+                continue
+            if attribute.high_cardinality and not high_cardinality_attributes:
+                continue
+
+            fk_column = ''
+            if path:
+                fk_column = path[0].fk_column
+
+            table_alias = table_alias_for_path(path) if path else entity_table_alias
+            column_name = attribute.column_name
+            column_alias = name if human_readable_columns else database_identifier(name)
+            custom_column_expression = None
+
+            first = add_column_definition(table_alias=table_alias, column_name=column_name, column_alias=column_alias,
+                                          cast_to_text=attribute.type == Type.ENUM, first=first,
+                                          custom_column_expression=custom_column_expression, date_column=date_column,
+                                          date_column_name=fk_column)
+
+    # helper function for pre-computing composed metrics
+
+    def aggregation_on_simple_metric(metric: SimpleMetric):
+        aggregation_string_start = ''
+        aggregation_string_end = ''
+        if metric.aggregation == Aggregation.COUNT:
+            aggregation_string_start = 'COUNT('
+            aggregation_string_end = ')'
+        elif metric.aggregation == Aggregation.SUM:
+            aggregation_string_start = 'SUM('
+            aggregation_string_end = ')'
+        elif metric.aggregation == Aggregation.AVERAGE:
+            aggregation_string_start = 'AVG('
+            aggregation_string_end = ')'
+        elif metric.aggregation == Aggregation.DISTINCT_COUNT:
+            aggregation_string_start = 'COUNT(DISTINCT '
+            aggregation_string_end = ')'
+        return aggregation_string_start, aggregation_string_end
+
+    first = True
+    for name, metric in data_set.metrics.items():
+        column_alias = metric.name if human_readable_columns else database_identifier(metric.name)
+
+        if isinstance(metric, SimpleMetric):
+            aggregation_start, aggregation_end = aggregation_on_simple_metric(metric)
+            column_definition = f'    {aggregation_start}{quote(entity_table_alias)}.{quote(metric.column_name)}' \
+                                f'{aggregation_end}'
+            if column_alias != metric.column_name:
+                column_definition += f' AS {quote(column_alias)}'
+        else:
+            continue
+
+        if first:
+            column_definition = '\n' + column_definition
+            first = False
+        column_definitions.append(column_definition)
+
+    # add column definitions to SELECT part
+    query += ',\n'.join(column_definitions)
+
+    # add FROM part for entity table
+    query += f'\n\nFROM {quote(data_set.entity.schema_name)}.{quote(data_set.entity.table_name)} {quote(entity_table_alias)}'
+
+    # Add LEFT JOIN statements
+    for path in data_set.paths_to_connected_entities():
+        left_alias = table_alias_for_path(path[:-1]) if len(path) > 1 else database_identifier(data_set.entity.name)
+        right_alias = table_alias_for_path(path)
+        entity_link = path[-1]
+        target_entity = entity_link.target_entity
+
+        if right_alias.split('.')[0] in [group_.split('.')[0] for group_ in group_by_column] or \
+                right_alias.split('.')[0] == date_column.lower():
+
+            query += f'\nLEFT JOIN {quote(target_entity.schema_name)}.{quote(target_entity.table_name)} {quote(right_alias)}'
+            query += f' ON {quote(left_alias)}.{quote(path[-1].fk_column)} = {quote(right_alias)}.{quote(target_entity.pk_column_name)}'
+
+    if group_by_column:
+        query += f'\nGROUP BY {", ".join(group_by_column)}'
+    return query
