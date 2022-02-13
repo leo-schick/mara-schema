@@ -144,7 +144,7 @@ class DataSet():
             attribute_names: A list of name of attributes to be excluded. If not provided, then exclude all attributes
         """
         entity_links = self._parse_path(self.entity, path)
-        entity = entity_links[-1].target_entity
+        entity = entity_links[-1].target_entity if path else self.entity
 
         if not attribute_names:
             self.excluded_attributes[entity_links] = entity.attributes
@@ -163,8 +163,9 @@ class DataSet():
             attribute_names: A list of name of attributes to be included.
         """
         entity_links = self._parse_path(self.entity, path)
+        entity = entity_links[-1].target_entity if path else self.entity
 
-        self.included_attributes[entity_links] = [entity_links[-1].target_entity.find_attribute(attribute_name) for
+        self.included_attributes[entity_links] = [entity.find_attribute(attribute_name) for
                                                   attribute_name in attribute_names]
 
     def paths_to_connected_entities(self) -> [(EntityLink,)]:
@@ -213,11 +214,10 @@ class DataSet():
                                                    'Prefixed attribute 2 name': <Attribute 2>},
                  ..}
         """
-        result = {(): {attribute.prefixed_name(): attribute for attribute in self.entity.attributes}}
+        result = {}
 
-        for path in self.paths_to_connected_entities():
+        def add_entity_attributes(path, entity):
             result[path] = {}
-            entity = path[-1].target_entity
             for attribute in entity.attributes:
                 if ((path in self.included_attributes and attribute in self.included_attributes[path])
                     or (path not in self.included_attributes)) \
@@ -226,6 +226,13 @@ class DataSet():
                     and attribute.accessible_via_entity_link and (
                     include_personal_data or not attribute.personal_data):
                     result[path][attribute.prefixed_name(path)] = attribute
+
+        add_entity_attributes(path=(), entity=self.entity)
+
+        for path in self.paths_to_connected_entities():
+            result[path] = {}
+            entity = path[-1].target_entity
+            add_entity_attributes(path, entity=path[-1].target_entity)
         return result
 
     def id(self):
